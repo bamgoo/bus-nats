@@ -8,7 +8,6 @@ import (
 	"github.com/bamgoo/bamgoo"
 	"github.com/bamgoo/bus"
 	"github.com/nats-io/nats.go"
-	"github.com/nats-io/nats.go/micro"
 )
 
 var (
@@ -26,20 +25,28 @@ type (
 
 		instance *bus.Instance
 		setting  natsBusSetting
-
 		client   *nats.Conn
-		services []micro.Service
 
 		subjects map[string]struct{}
 		subs     []*nats.Subscription
+
+		stats map[string]*statsEntry
 	}
 
 	natsBusSetting struct {
 		URL        string
+		Token      string
 		Username   string
 		Password   string
 		QueueGroup string
 		Version    string
+	}
+
+	statsEntry struct {
+		name         string
+		numRequests  int
+		numErrors    int
+		totalLatency int64
 	}
 )
 
@@ -53,28 +60,31 @@ func (driver *natsBusDriver) Connect(inst *bus.Instance) (bus.Connection, error)
 		Version: "1.0.0",
 	}
 
-	if v, ok := inst.Config.Setting["url"].(string); ok {
+	if v, ok := inst.Config.Setting["url"].(string); ok && v != "" {
 		setting.URL = v
 	}
-	if v, ok := inst.Config.Setting["server"].(string); ok {
+	if v, ok := inst.Config.Setting["server"].(string); ok && v != "" {
 		setting.URL = v
 	}
-	if v, ok := inst.Config.Setting["user"].(string); ok {
+	if v, ok := inst.Config.Setting["token"].(string); ok && v != "" {
+		setting.Token = v
+	}
+	if v, ok := inst.Config.Setting["user"].(string); ok && v != "" {
 		setting.Username = v
 	}
-	if v, ok := inst.Config.Setting["username"].(string); ok {
+	if v, ok := inst.Config.Setting["username"].(string); ok && v != "" {
 		setting.Username = v
 	}
-	if v, ok := inst.Config.Setting["pass"].(string); ok {
+	if v, ok := inst.Config.Setting["pass"].(string); ok && v != "" {
 		setting.Password = v
 	}
-	if v, ok := inst.Config.Setting["password"].(string); ok {
+	if v, ok := inst.Config.Setting["password"].(string); ok && v != "" {
 		setting.Password = v
 	}
-	if v, ok := inst.Config.Setting["group"].(string); ok {
+	if v, ok := inst.Config.Setting["group"].(string); ok && v != "" {
 		setting.QueueGroup = v
 	}
-	if v, ok := inst.Config.Setting["version"].(string); ok {
+	if v, ok := inst.Config.Setting["version"].(string); ok && v != "" {
 		setting.Version = v
 	}
 
@@ -83,11 +93,10 @@ func (driver *natsBusDriver) Connect(inst *bus.Instance) (bus.Connection, error)
 		setting:  setting,
 		subjects: make(map[string]struct{}, 0),
 		subs:     make([]*nats.Subscription, 0),
-		services: make([]micro.Service, 0),
+		stats:    make(map[string]*statsEntry, 0),
 	}, nil
 }
 
-// Register registers a service subject.
 func (c *natsBusConnection) Register(subject string) error {
 	c.mutex.Lock()
 	c.subjects[subject] = struct{}{}
@@ -97,7 +106,10 @@ func (c *natsBusConnection) Register(subject string) error {
 
 func (c *natsBusConnection) Open() error {
 	opts := []nats.Option{}
-	if c.setting.Username != "" && c.setting.Password != "" {
+	if c.setting.Token != "" {
+		opts = append(opts, nats.Token(c.setting.Token))
+	}
+	if c.setting.Username != "" || c.setting.Password != "" {
 		opts = append(opts, nats.UserInfo(c.setting.Username, c.setting.Password))
 	}
 
@@ -105,7 +117,6 @@ func (c *natsBusConnection) Open() error {
 	if err != nil {
 		return err
 	}
-
 	c.client = client
 	return nil
 }
@@ -128,43 +139,45 @@ func (c *natsBusConnection) Start() error {
 		return errNatsInvalidConnection
 	}
 
-	// Create micro services for each registered subject
 	for subject := range c.subjects {
-		// Create micro service for call (request/reply)
-		svc, err := micro.AddService(c.client, micro.Config{
-			Name:        subject,
-			Version:     c.setting.Version,
-			Description: "Bamgoo service: " + subject,
-			QueueGroup:  c.queueGroup(subject),
-			Endpoint: &micro.EndpointConfig{
-				Subject: "call." + subject,
-				Handler: micro.HandlerFunc(c.handleMicroRequest),
-			},
-		})
-		if err != nil {
-			return err
-		}
-		c.services = append(c.services, svc)
+		callSubject := "call." + subject
+		queueSubject := "queue." + subject
+		eventSubject := "event." + subject
 
-		// queue - async with queue group (one subscriber receives)
-		queueSub := "queue." + subject
-		sub, err := c.client.QueueSubscribe(queueSub, c.queueGroup(queueSub), func(msg *nats.Msg) {
-			c.handleRequest(msg.Data)
+		callSub, err := c.client.QueueSubscribe(callSubject, c.queueGroup(callSubject), func(msg *nats.Msg) {
+			started := time.Now()
+			resp, callErr := c.handleCall(msg.Data)
+			if callErr != nil {
+				c.recordStats(subject, time.Since(started), callErr)
+				return
+			}
+			_ = msg.Respond(resp)
+			c.recordStats(subject, time.Since(started), nil)
 		})
 		if err != nil {
 			return err
 		}
-		c.subs = append(c.subs, sub)
+		c.subs = append(c.subs, callSub)
 
-		// event - broadcast to all subscribers
-		eventSub := "event." + subject
-		sub, err = c.client.Subscribe(eventSub, func(msg *nats.Msg) {
-			c.handleRequest(msg.Data)
+		queueSub, err := c.client.QueueSubscribe(queueSubject, c.queueGroup(queueSubject), func(msg *nats.Msg) {
+			started := time.Now()
+			asyncErr := c.handleAsync(msg.Data)
+			c.recordStats(subject, time.Since(started), asyncErr)
 		})
 		if err != nil {
 			return err
 		}
-		c.subs = append(c.subs, sub)
+		c.subs = append(c.subs, queueSub)
+
+		eventSub, err := c.client.Subscribe(eventSubject, func(msg *nats.Msg) {
+			started := time.Now()
+			asyncErr := c.handleAsync(msg.Data)
+			c.recordStats(subject, time.Since(started), asyncErr)
+		})
+		if err != nil {
+			return err
+		}
+		c.subs = append(c.subs, eventSub)
 	}
 
 	c.running = true
@@ -179,23 +192,14 @@ func (c *natsBusConnection) Stop() error {
 		return errNatsNotRunning
 	}
 
-	// Stop micro services
-	for _, svc := range c.services {
-		_ = svc.Stop()
-	}
-	c.services = nil
-
-	// Unsubscribe from queue and event
 	for _, sub := range c.subs {
 		_ = sub.Unsubscribe()
 	}
 	c.subs = nil
-
 	c.running = false
 	return nil
 }
 
-// Request sends a synchronous request and waits for reply.
 func (c *natsBusConnection) Request(subject string, data []byte, timeout time.Duration) ([]byte, error) {
 	if c.client == nil {
 		return nil, errNatsInvalidConnection
@@ -205,11 +209,9 @@ func (c *natsBusConnection) Request(subject string, data []byte, timeout time.Du
 	if err != nil {
 		return nil, err
 	}
-
 	return msg.Data, nil
 }
 
-// Publish broadcasts an event to all subscribers.
 func (c *natsBusConnection) Publish(subject string, data []byte) error {
 	if c.client == nil {
 		return errNatsInvalidConnection
@@ -217,7 +219,6 @@ func (c *natsBusConnection) Publish(subject string, data []byte) error {
 	return c.client.Publish(subject, data)
 }
 
-// Enqueue publishes to a queue (one of the subscribers will receive).
 func (c *natsBusConnection) Enqueue(subject string, data []byte) error {
 	if c.client == nil {
 		return errNatsInvalidConnection
@@ -225,61 +226,61 @@ func (c *natsBusConnection) Enqueue(subject string, data []byte) error {
 	return c.client.Publish(subject, data)
 }
 
-// Stats returns statistics for all micro services.
 func (c *natsBusConnection) Stats() []bamgoo.ServiceStats {
 	c.mutex.RLock()
 	defer c.mutex.RUnlock()
 
-	stats := make([]bamgoo.ServiceStats, 0, len(c.services))
-	for _, svc := range c.services {
-		info := svc.Info()
-		st := svc.Stats()
-
-		var numRequests, numErrors int
-		var totalLatency int64
-		for _, ep := range st.Endpoints {
-			numRequests += ep.NumRequests
-			numErrors += ep.NumErrors
-			totalLatency += int64(ep.ProcessingTime.Milliseconds())
+	all := make([]bamgoo.ServiceStats, 0, len(c.stats))
+	for _, st := range c.stats {
+		avg := int64(0)
+		if st.numRequests > 0 {
+			avg = st.totalLatency / int64(st.numRequests)
 		}
-
-		avgLatency := int64(0)
-		if numRequests > 0 {
-			avgLatency = totalLatency / int64(numRequests)
-		}
-
-		stats = append(stats, bamgoo.ServiceStats{
-			Name:         info.Name,
-			Version:      info.Version,
-			NumRequests:  numRequests,
-			NumErrors:    numErrors,
-			TotalLatency: totalLatency,
-			AvgLatency:   avgLatency,
+		all = append(all, bamgoo.ServiceStats{
+			Name:         st.name,
+			Version:      c.setting.Version,
+			NumRequests:  st.numRequests,
+			NumErrors:    st.numErrors,
+			TotalLatency: st.totalLatency,
+			AvgLatency:   avg,
 		})
 	}
-	return stats
+	return all
 }
 
 func (c *natsBusConnection) queueGroup(subject string) string {
 	if c.setting.QueueGroup != "" {
-		return c.setting.QueueGroup
+		return c.setting.QueueGroup + "." + subject
 	}
 	return subject
 }
 
-// handleMicroRequest handles micro service requests.
-func (c *natsBusConnection) handleMicroRequest(req micro.Request) {
-	resp, err := c.handleRequest(req.Data())
-	if err != nil {
-		req.Error("500", err.Error(), nil)
-		return
-	}
-	req.Respond(resp)
-}
-
-func (c *natsBusConnection) handleRequest(data []byte) ([]byte, error) {
+func (c *natsBusConnection) handleCall(data []byte) ([]byte, error) {
 	if c.instance == nil {
 		c.instance = &bus.Instance{}
 	}
 	return c.instance.HandleCall(data)
+}
+
+func (c *natsBusConnection) handleAsync(data []byte) error {
+	if c.instance == nil {
+		c.instance = &bus.Instance{}
+	}
+	return c.instance.HandleAsync(data)
+}
+
+func (c *natsBusConnection) recordStats(subject string, cost time.Duration, err error) {
+	c.mutex.Lock()
+	defer c.mutex.Unlock()
+
+	st, ok := c.stats[subject]
+	if !ok {
+		st = &statsEntry{name: subject}
+		c.stats[subject] = st
+	}
+	st.numRequests++
+	st.totalLatency += cost.Milliseconds()
+	if err != nil {
+		st.numErrors++
+	}
 }
