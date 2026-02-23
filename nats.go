@@ -3,6 +3,7 @@ package bus_nats
 import (
 	"encoding/json"
 	"errors"
+	"math/rand"
 	"sort"
 	"strings"
 	"sync"
@@ -23,6 +24,7 @@ const (
 	systemAnnounceTopic    = "announce"
 	defaultAnnouncePeriod  = 10 * time.Second
 	defaultAnnounceTimeout = 30 * time.Second
+	defaultAnnounceJitter  = 2 * time.Second
 )
 
 type (
@@ -43,11 +45,13 @@ type (
 		cache    map[string]bamgoo.NodeInfo
 
 		announceInterval time.Duration
+		announceJitter   time.Duration
 		announceTTL      time.Duration
 		done             chan struct{}
 		wg               sync.WaitGroup
 
 		stats map[string]*statsEntry
+		rnd   *rand.Rand
 	}
 
 	natsBusSetting struct {
@@ -60,6 +64,7 @@ type (
 		Version    string
 
 		AnnounceInterval time.Duration
+		AnnounceJitter   time.Duration
 		AnnounceTTL      time.Duration
 	}
 
@@ -117,6 +122,14 @@ func (driver *natsBusDriver) Connect(inst *bus.Instance) (bus.Connection, error)
 	if setting.AnnounceTTL <= 0 {
 		setting.AnnounceTTL = defaultAnnounceTimeout
 	}
+	setting.AnnounceJitter = parseDurationSetting(inst.Config.Setting["jitter"])
+	if setting.AnnounceJitter <= 0 {
+		// compatibility with older key
+		setting.AnnounceJitter = parseDurationSetting(inst.Config.Setting["announce_jitter"])
+	}
+	if setting.AnnounceJitter <= 0 {
+		setting.AnnounceJitter = defaultAnnounceJitter
+	}
 
 	id := bamgoo.Identity()
 	project := bamgoo.Project()
@@ -143,9 +156,11 @@ func (driver *natsBusDriver) Connect(inst *bus.Instance) (bus.Connection, error)
 		},
 		cache:            make(map[string]bamgoo.NodeInfo, 0),
 		announceInterval: setting.AnnounceInterval,
+		announceJitter:   setting.AnnounceJitter,
 		announceTTL:      setting.AnnounceTTL,
 		done:             make(chan struct{}),
 		stats:            make(map[string]*statsEntry, 0),
+		rnd:              rand.New(rand.NewSource(time.Now().UnixNano())),
 	}, nil
 }
 
@@ -448,14 +463,19 @@ type announcePayload struct {
 
 func (c *natsBusConnection) announceLoop() {
 	defer c.wg.Done()
-	ticker := time.NewTicker(c.announceInterval)
-	defer ticker.Stop()
-
 	for {
+		wait := c.nextAnnounceDelay()
+		timer := time.NewTimer(wait)
 		select {
-		case <-ticker.C:
+		case <-timer.C:
 			c.publishAnnounce()
 		case <-c.done:
+			if !timer.Stop() {
+				select {
+				case <-timer.C:
+				default:
+				}
+			}
 			return
 		}
 	}
@@ -598,6 +618,28 @@ func (c *natsBusConnection) systemPrefixValue() string {
 
 func (c *natsBusConnection) systemSubject(msg string) string {
 	return "_" + c.systemPrefixValue() + "." + msg
+}
+
+func (c *natsBusConnection) nextAnnounceDelay() time.Duration {
+	base := c.announceInterval
+	if base <= 0 {
+		base = defaultAnnouncePeriod
+	}
+	jitter := c.announceJitter
+	if jitter <= 0 || c.rnd == nil {
+		return base
+	}
+
+	span := jitter.Milliseconds()
+	if span <= 0 {
+		return base
+	}
+	offsetMs := c.rnd.Int63n(span*2+1) - span
+	delay := base + time.Duration(offsetMs)*time.Millisecond
+	if delay < 100*time.Millisecond {
+		delay = 100 * time.Millisecond
+	}
+	return delay
 }
 
 func parseDurationSetting(v any) time.Duration {
