@@ -1,7 +1,10 @@
 package bus_nats
 
 import (
+	"encoding/json"
 	"errors"
+	"sort"
+	"strings"
 	"sync"
 	"time"
 
@@ -14,6 +17,12 @@ var (
 	errNatsInvalidConnection = errors.New("invalid nats connection")
 	errNatsAlreadyRunning    = errors.New("nats bus is already running")
 	errNatsNotRunning        = errors.New("nats bus is not running")
+)
+
+const (
+	announceTopic          = "_bamgoo.announce"
+	defaultAnnouncePeriod  = 10 * time.Second
+	defaultAnnounceTimeout = 30 * time.Second
 )
 
 type (
@@ -30,6 +39,14 @@ type (
 		subjects map[string]struct{}
 		subs     []*nats.Subscription
 
+		identity bamgoo.NodeInfo
+		cache    map[string]bamgoo.NodeInfo
+
+		announceInterval time.Duration
+		announceTTL      time.Duration
+		done             chan struct{}
+		wg               sync.WaitGroup
+
 		stats map[string]*statsEntry
 	}
 
@@ -39,7 +56,11 @@ type (
 		Username   string
 		Password   string
 		QueueGroup string
+		Prefix     string
 		Version    string
+
+		AnnounceInterval time.Duration
+		AnnounceTTL      time.Duration
 	}
 
 	statsEntry struct {
@@ -58,6 +79,7 @@ func (driver *natsBusDriver) Connect(inst *bus.Instance) (bus.Connection, error)
 	setting := natsBusSetting{
 		URL:     nats.DefaultURL,
 		Version: "1.0.0",
+		Prefix:  inst.Config.Prefix,
 	}
 
 	if v, ok := inst.Config.Setting["url"].(string); ok && v != "" {
@@ -87,13 +109,43 @@ func (driver *natsBusDriver) Connect(inst *bus.Instance) (bus.Connection, error)
 	if v, ok := inst.Config.Setting["version"].(string); ok && v != "" {
 		setting.Version = v
 	}
+	setting.AnnounceInterval = parseDurationSetting(inst.Config.Setting["announce"])
+	if setting.AnnounceInterval <= 0 {
+		setting.AnnounceInterval = defaultAnnouncePeriod
+	}
+	setting.AnnounceTTL = parseDurationSetting(inst.Config.Setting["announce_ttl"])
+	if setting.AnnounceTTL <= 0 {
+		setting.AnnounceTTL = defaultAnnounceTimeout
+	}
 
+	id := bamgoo.Identity()
+	project := bamgoo.Project()
+	if strings.TrimSpace(project) == "" {
+		project = bamgoo.BAMGOO
+	}
+	node := id.Node
+	if strings.TrimSpace(node) == "" {
+		node = bamgoo.Generate("node")
+	}
+	role := id.Role
+	if strings.TrimSpace(role) == "" {
+		role = bamgoo.BAMGOO
+	}
 	return &natsBusConnection{
 		instance: inst,
 		setting:  setting,
 		subjects: make(map[string]struct{}, 0),
 		subs:     make([]*nats.Subscription, 0),
-		stats:    make(map[string]*statsEntry, 0),
+		identity: bamgoo.NodeInfo{
+			Project: project,
+			Node:    node,
+			Role:    role,
+		},
+		cache:            make(map[string]bamgoo.NodeInfo, 0),
+		announceInterval: setting.AnnounceInterval,
+		announceTTL:      setting.AnnounceTTL,
+		done:             make(chan struct{}),
+		stats:            make(map[string]*statsEntry, 0),
 	}, nil
 }
 
@@ -130,12 +182,12 @@ func (c *natsBusConnection) Close() error {
 
 func (c *natsBusConnection) Start() error {
 	c.mutex.Lock()
-	defer c.mutex.Unlock()
-
 	if c.running {
+		c.mutex.Unlock()
 		return errNatsAlreadyRunning
 	}
 	if c.client == nil {
+		c.mutex.Unlock()
 		return errNatsInvalidConnection
 	}
 
@@ -155,6 +207,7 @@ func (c *natsBusConnection) Start() error {
 			c.recordStats(subject, time.Since(started), nil)
 		})
 		if err != nil {
+			c.mutex.Unlock()
 			return err
 		}
 		c.subs = append(c.subs, callSub)
@@ -165,6 +218,7 @@ func (c *natsBusConnection) Start() error {
 			c.recordStats(subject, time.Since(started), asyncErr)
 		})
 		if err != nil {
+			c.mutex.Unlock()
 			return err
 		}
 		c.subs = append(c.subs, queueSub)
@@ -175,28 +229,57 @@ func (c *natsBusConnection) Start() error {
 			c.recordStats(subject, time.Since(started), asyncErr)
 		})
 		if err != nil {
+			c.mutex.Unlock()
 			return err
 		}
 		c.subs = append(c.subs, eventSub)
 	}
 
+	announceSub, err := c.client.Subscribe(c.announceSubject(), func(msg *nats.Msg) {
+		c.onAnnounce(msg.Data)
+	})
+	if err != nil {
+		c.mutex.Unlock()
+		return err
+	}
+	c.subs = append(c.subs, announceSub)
+
 	c.running = true
+	c.mutex.Unlock()
+
+	c.publishAnnounce()
+
+	c.wg.Add(2)
+	go c.announceLoop()
+	go c.gcLoop()
+
 	return nil
 }
 
 func (c *natsBusConnection) Stop() error {
 	c.mutex.Lock()
-	defer c.mutex.Unlock()
-
 	if !c.running {
+		c.mutex.Unlock()
 		return errNatsNotRunning
 	}
 
-	for _, sub := range c.subs {
+	subs := c.subs
+	c.subs = nil
+	done := c.done
+	c.done = make(chan struct{})
+	c.running = false
+	c.mutex.Unlock()
+
+	c.publishOffline()
+
+	close(done)
+
+	for _, sub := range subs {
 		_ = sub.Unsubscribe()
 	}
-	c.subs = nil
-	c.running = false
+
+	c.wg.Wait()
+
 	return nil
 }
 
@@ -248,6 +331,73 @@ func (c *natsBusConnection) Stats() []bamgoo.ServiceStats {
 	return all
 }
 
+func (c *natsBusConnection) ListNodes() []bamgoo.NodeInfo {
+	c.mutex.RLock()
+	defer c.mutex.RUnlock()
+
+	now := time.Now().UnixMilli()
+	out := make([]bamgoo.NodeInfo, 0, len(c.cache))
+	for _, item := range c.cache {
+		if c.announceTTL > 0 && now-item.Updated > c.announceTTL.Milliseconds() {
+			continue
+		}
+		item.Services = cloneStrings(item.Services)
+		out = append(out, item)
+	}
+
+	sort.Slice(out, func(i, j int) bool {
+		if out[i].Project == out[j].Project {
+			if out[i].Role == out[j].Role {
+				return out[i].Node < out[j].Node
+			}
+			return out[i].Role < out[j].Role
+		}
+		return out[i].Project < out[j].Project
+	})
+	return out
+}
+
+func (c *natsBusConnection) ListServices() []bamgoo.ServiceInfo {
+	nodes := c.ListNodes()
+	if len(nodes) == 0 {
+		return nil
+	}
+	merged := make(map[string]*bamgoo.ServiceInfo)
+	for _, node := range nodes {
+		for _, svc := range node.Services {
+			svcKey := svc
+			info, ok := merged[svcKey]
+			if !ok {
+				info = &bamgoo.ServiceInfo{Service: svc, Name: svc}
+				merged[svcKey] = info
+			}
+			info.Nodes = append(info.Nodes, bamgoo.ServiceNode{
+				Node: node.Node,
+				Role: node.Role,
+			})
+			if node.Updated > info.Updated {
+				info.Updated = node.Updated
+			}
+		}
+	}
+
+	out := make([]bamgoo.ServiceInfo, 0, len(merged))
+	for _, info := range merged {
+		sort.Slice(info.Nodes, func(i, j int) bool {
+			if info.Nodes[i].Role == info.Nodes[j].Role {
+				return info.Nodes[i].Node < info.Nodes[j].Node
+			}
+			return info.Nodes[i].Role < info.Nodes[j].Role
+		})
+		info.Instances = len(info.Nodes)
+		out = append(out, *info)
+	}
+	sort.Slice(out, func(i, j int) bool {
+		return out[i].Service < out[j].Service
+	})
+	return out
+}
+
 func (c *natsBusConnection) queueGroup(subject string) string {
 	if c.setting.QueueGroup != "" {
 		return c.setting.QueueGroup + "." + subject
@@ -283,4 +433,193 @@ func (c *natsBusConnection) recordStats(subject string, cost time.Duration, err 
 	if err != nil {
 		st.numErrors++
 	}
+}
+
+type announcePayload struct {
+	Project  string   `json:"project"`
+	Node     string   `json:"node"`
+	Role     string   `json:"role"`
+	Services []string `json:"services"`
+	Updated  int64    `json:"updated"`
+	Online   *bool    `json:"online,omitempty"`
+}
+
+func (c *natsBusConnection) announceLoop() {
+	defer c.wg.Done()
+	ticker := time.NewTicker(c.announceInterval)
+	defer ticker.Stop()
+
+	for {
+		select {
+		case <-ticker.C:
+			c.publishAnnounce()
+		case <-c.done:
+			return
+		}
+	}
+}
+
+func (c *natsBusConnection) gcLoop() {
+	defer c.wg.Done()
+	interval := c.announceInterval
+	if interval <= 0 {
+		interval = defaultAnnouncePeriod
+	}
+	ticker := time.NewTicker(interval)
+	defer ticker.Stop()
+	for {
+		select {
+		case <-ticker.C:
+			c.gcCache()
+		case <-c.done:
+			return
+		}
+	}
+}
+
+func (c *natsBusConnection) publishAnnounce() {
+	c.publishAnnounceState(true)
+}
+
+func (c *natsBusConnection) publishOffline() {
+	c.publishAnnounceState(false)
+}
+
+func (c *natsBusConnection) publishAnnounceState(online bool) {
+	if c.client == nil {
+		return
+	}
+	payload := announcePayload{
+		Project: c.identity.Project,
+		Node:    c.identity.Node,
+		Role:    c.identity.Role,
+		Updated: time.Now().UnixMilli(),
+	}
+	if online {
+		payload.Services = c.currentServices()
+	}
+	flag := online
+	payload.Online = &flag
+	data, err := json.Marshal(payload)
+	if err != nil {
+		return
+	}
+	_ = c.client.Publish(c.announceSubject(), data)
+	c.onAnnounce(data)
+}
+
+func (c *natsBusConnection) onAnnounce(data []byte) {
+	var payload announcePayload
+	if err := json.Unmarshal(data, &payload); err != nil {
+		return
+	}
+	if strings.TrimSpace(payload.Node) == "" {
+		return
+	}
+	if strings.TrimSpace(payload.Project) == "" {
+		payload.Project = bamgoo.BAMGOO
+	}
+	online := true
+	if payload.Online != nil {
+		online = *payload.Online
+	}
+
+	c.mutex.Lock()
+	defer c.mutex.Unlock()
+
+	key := payload.Project + "|" + payload.Node
+	if !online {
+		delete(c.cache, key)
+		return
+	}
+
+	c.cache[key] = bamgoo.NodeInfo{
+		Project:  payload.Project,
+		Node:     payload.Node,
+		Role:     payload.Role,
+		Services: uniqueStrings(payload.Services),
+		Updated:  payload.Updated,
+	}
+}
+
+func (c *natsBusConnection) gcCache() {
+	c.mutex.Lock()
+	defer c.mutex.Unlock()
+
+	if c.announceTTL <= 0 {
+		return
+	}
+	now := time.Now().UnixMilli()
+	for key, item := range c.cache {
+		if now-item.Updated > c.announceTTL.Milliseconds() {
+			delete(c.cache, key)
+		}
+	}
+}
+
+func (c *natsBusConnection) currentServices() []string {
+	c.mutex.RLock()
+	defer c.mutex.RUnlock()
+
+	names := make([]string, 0, len(c.subjects))
+	for name := range c.subjects {
+		names = append(names, c.serviceName(name))
+	}
+	sort.Strings(names)
+	return names
+}
+
+func (c *natsBusConnection) serviceName(subject string) string {
+	if c.setting.Prefix == "" {
+		return subject
+	}
+	return strings.TrimPrefix(subject, c.setting.Prefix)
+}
+
+func (c *natsBusConnection) announceSubject() string {
+	if c.setting.Prefix == "" {
+		return announceTopic
+	}
+	return c.setting.Prefix + announceTopic
+}
+
+func parseDurationSetting(v any) time.Duration {
+	switch vv := v.(type) {
+	case time.Duration:
+		return vv
+	case int:
+		return time.Second * time.Duration(vv)
+	case int64:
+		return time.Second * time.Duration(vv)
+	case float64:
+		return time.Second * time.Duration(vv)
+	case string:
+		if d, err := time.ParseDuration(vv); err == nil {
+			return d
+		}
+	}
+	return 0
+}
+
+func uniqueStrings(in []string) []string {
+	if len(in) == 0 {
+		return []string{}
+	}
+	seen := make(map[string]struct{}, len(in))
+	out := make([]string, 0, len(in))
+	for _, v := range in {
+		if _, ok := seen[v]; ok {
+			continue
+		}
+		seen[v] = struct{}{}
+		out = append(out, v)
+	}
+	sort.Strings(out)
+	return out
+}
+
+func cloneStrings(in []string) []string {
+	out := make([]string, len(in))
+	copy(out, in)
+	return out
 }
