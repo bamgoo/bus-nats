@@ -132,7 +132,7 @@ func (driver *natsBusDriver) Connect(inst *bus.Instance) (bus.Connection, error)
 	}
 
 	id := bamgoo.Identity()
-	project := bamgoo.Project()
+	project := id.Project
 	if strings.TrimSpace(project) == "" {
 		project = bamgoo.BAMGOO
 	}
@@ -140,9 +140,9 @@ func (driver *natsBusDriver) Connect(inst *bus.Instance) (bus.Connection, error)
 	if strings.TrimSpace(node) == "" {
 		node = bamgoo.Generate("node")
 	}
-	role := id.Role
-	if strings.TrimSpace(role) == "" {
-		role = bamgoo.BAMGOO
+	profile := id.Profile
+	if strings.TrimSpace(profile) == "" {
+		profile = bamgoo.BAMGOO
 	}
 	return &natsBusConnection{
 		instance: inst,
@@ -152,7 +152,7 @@ func (driver *natsBusDriver) Connect(inst *bus.Instance) (bus.Connection, error)
 		identity: bamgoo.NodeInfo{
 			Project: project,
 			Node:    node,
-			Role:    role,
+			Profile: profile,
 		},
 		cache:            make(map[string]bamgoo.NodeInfo, 0),
 		announceInterval: setting.AnnounceInterval,
@@ -364,10 +364,10 @@ func (c *natsBusConnection) ListNodes() []bamgoo.NodeInfo {
 
 	sort.Slice(out, func(i, j int) bool {
 		if out[i].Project == out[j].Project {
-			if out[i].Role == out[j].Role {
+			if out[i].Profile == out[j].Profile {
 				return out[i].Node < out[j].Node
 			}
-			return out[i].Role < out[j].Role
+			return out[i].Profile < out[j].Profile
 		}
 		return out[i].Project < out[j].Project
 	})
@@ -389,8 +389,8 @@ func (c *natsBusConnection) ListServices() []bamgoo.ServiceInfo {
 				merged[svcKey] = info
 			}
 			info.Nodes = append(info.Nodes, bamgoo.ServiceNode{
-				Node: node.Node,
-				Role: node.Role,
+				Node:    node.Node,
+				Profile: node.Profile,
 			})
 			if node.Updated > info.Updated {
 				info.Updated = node.Updated
@@ -401,10 +401,10 @@ func (c *natsBusConnection) ListServices() []bamgoo.ServiceInfo {
 	out := make([]bamgoo.ServiceInfo, 0, len(merged))
 	for _, info := range merged {
 		sort.Slice(info.Nodes, func(i, j int) bool {
-			if info.Nodes[i].Role == info.Nodes[j].Role {
+			if info.Nodes[i].Profile == info.Nodes[j].Profile {
 				return info.Nodes[i].Node < info.Nodes[j].Node
 			}
-			return info.Nodes[i].Role < info.Nodes[j].Role
+			return info.Nodes[i].Profile < info.Nodes[j].Profile
 		})
 		info.Instances = len(info.Nodes)
 		out = append(out, *info)
@@ -455,7 +455,7 @@ func (c *natsBusConnection) recordStats(subject string, cost time.Duration, err 
 type announcePayload struct {
 	Project  string   `json:"project"`
 	Node     string   `json:"node"`
-	Role     string   `json:"role"`
+	Profile  string   `json:"profile"`
 	Services []string `json:"services"`
 	Updated  int64    `json:"updated"`
 	Online   *bool    `json:"online,omitempty"`
@@ -514,7 +514,7 @@ func (c *natsBusConnection) publishAnnounceState(online bool) {
 	payload := announcePayload{
 		Project: c.identity.Project,
 		Node:    c.identity.Node,
-		Role:    c.identity.Role,
+		Profile: c.identity.Profile,
 		Updated: time.Now().UnixMilli(),
 	}
 	if online {
@@ -558,7 +558,7 @@ func (c *natsBusConnection) onAnnounce(data []byte) {
 	c.cache[key] = bamgoo.NodeInfo{
 		Project:  payload.Project,
 		Node:     payload.Node,
-		Role:     payload.Role,
+		Profile:  payload.Profile,
 		Services: uniqueStrings(payload.Services),
 		Updated:  payload.Updated,
 	}
@@ -608,7 +608,7 @@ func (c *natsBusConnection) systemPrefixValue() string {
 	}
 	project := strings.TrimSpace(c.identity.Project)
 	if project == "" {
-		project = strings.TrimSpace(bamgoo.Project())
+		project = strings.TrimSpace(bamgoo.Identity().Project)
 	}
 	if project == "" {
 		project = bamgoo.BAMGOO
