@@ -20,7 +20,7 @@ var (
 )
 
 const (
-	announceTopic          = "_bamgoo.announce"
+	systemAnnounceTopic    = "announce"
 	defaultAnnouncePeriod  = 10 * time.Second
 	defaultAnnounceTimeout = 30 * time.Second
 )
@@ -577,10 +577,25 @@ func (c *natsBusConnection) serviceName(subject string) string {
 }
 
 func (c *natsBusConnection) announceSubject() string {
-	if c.setting.Prefix == "" {
-		return announceTopic
+	return c.systemSubject(systemAnnounceTopic)
+}
+
+func (c *natsBusConnection) systemPrefixValue() string {
+	if c.setting.Prefix != "" {
+		return strings.TrimSuffix(c.setting.Prefix, ".")
 	}
-	return c.setting.Prefix + announceTopic
+	project := strings.TrimSpace(c.identity.Project)
+	if project == "" {
+		project = strings.TrimSpace(bamgoo.Project())
+	}
+	if project == "" {
+		project = bamgoo.BAMGOO
+	}
+	return project
+}
+
+func (c *natsBusConnection) systemSubject(msg string) string {
+	return "_" + c.systemPrefixValue() + "." + msg
 }
 
 func parseDurationSetting(v any) time.Duration {
