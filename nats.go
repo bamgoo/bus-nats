@@ -266,7 +266,6 @@ func (c *natsBusConnection) Stop() error {
 	subs := c.subs
 	c.subs = nil
 	done := c.done
-	c.done = make(chan struct{})
 	c.running = false
 	c.mutex.Unlock()
 
@@ -279,6 +278,9 @@ func (c *natsBusConnection) Stop() error {
 	}
 
 	c.wg.Wait()
+	c.mutex.Lock()
+	c.done = make(chan struct{})
+	c.mutex.Unlock()
 
 	return nil
 }
