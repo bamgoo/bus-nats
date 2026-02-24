@@ -55,13 +55,14 @@ type (
 	}
 
 	natsBusSetting struct {
-		URL        string
-		Token      string
-		Username   string
-		Password   string
-		QueueGroup string
-		Prefix     string
-		Version    string
+		URL          string
+		Token        string
+		Username     string
+		Password     string
+		QueueGroup   string
+		PublishGroup string
+		Prefix       string
+		Version      string
 
 		AnnounceInterval time.Duration
 		AnnounceJitter   time.Duration
@@ -110,6 +111,12 @@ func (driver *natsBusDriver) Connect(inst *bus.Instance) (bus.Connection, error)
 	}
 	if v, ok := inst.Config.Setting["group"].(string); ok && v != "" {
 		setting.QueueGroup = v
+	}
+	if v := strings.TrimSpace(inst.Config.Group); v != "" {
+		setting.PublishGroup = v
+	}
+	if v, ok := inst.Config.Setting["profile"].(string); ok && v != "" {
+		setting.PublishGroup = v
 	}
 	if v, ok := inst.Config.Setting["version"].(string); ok && v != "" {
 		setting.Version = v
@@ -210,6 +217,7 @@ func (c *natsBusConnection) Start() error {
 		callSubject := "call." + subject
 		queueSubject := "queue." + subject
 		eventSubject := "event." + subject
+		groupSubject := "publish." + subject
 
 		callSub, err := c.client.QueueSubscribe(callSubject, c.queueGroup(callSubject), func(msg *nats.Msg) {
 			started := time.Now()
@@ -248,6 +256,17 @@ func (c *natsBusConnection) Start() error {
 			return err
 		}
 		c.subs = append(c.subs, eventSub)
+
+		groupSub, err := c.client.QueueSubscribe(groupSubject, c.publishGroup(groupSubject), func(msg *nats.Msg) {
+			started := time.Now()
+			asyncErr := c.handleAsync(msg.Data)
+			c.recordStats(subject, time.Since(started), asyncErr)
+		})
+		if err != nil {
+			c.mutex.Unlock()
+			return err
+		}
+		c.subs = append(c.subs, groupSub)
 	}
 
 	announceSub, err := c.client.Subscribe(c.announceSubject(), func(msg *nats.Msg) {
@@ -420,6 +439,17 @@ func (c *natsBusConnection) queueGroup(subject string) string {
 		return c.setting.QueueGroup + "." + subject
 	}
 	return subject
+}
+
+func (c *natsBusConnection) publishGroup(subject string) string {
+	group := strings.TrimSpace(c.setting.PublishGroup)
+	if group == "" {
+		group = strings.TrimSpace(c.identity.Profile)
+	}
+	if group == "" {
+		group = bamgoo.GLOBAL
+	}
+	return group + "." + subject
 }
 
 func (c *natsBusConnection) handleCall(data []byte) ([]byte, error) {
