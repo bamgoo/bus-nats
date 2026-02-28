@@ -1,7 +1,6 @@
 package bus_nats
 
 import (
-	"encoding/json"
 	"fmt"
 	"net"
 	"testing"
@@ -11,6 +10,7 @@ import (
 	base "github.com/bamgoo/base"
 	"github.com/bamgoo/bus"
 	"github.com/nats-io/nats-server/v2/server"
+	"github.com/vmihailenco/msgpack/v5"
 )
 
 func TestNatsBusCrossNodeRequest(t *testing.T) {
@@ -99,7 +99,7 @@ func TestNatsBusCrossNodeRequest(t *testing.T) {
 		"name":    serviceName,
 		"payload": map[string]any{"hello": "world"},
 	}
-	reqBytes, _ := json.Marshal(reqBody)
+	reqBytes, _ := msgpack.Marshal(reqBody)
 
 	for i := 0; i < 3; i++ {
 		respBytes, err := requester.Request("call."+serviceName, reqBytes, 2*time.Second)
@@ -108,7 +108,7 @@ func TestNatsBusCrossNodeRequest(t *testing.T) {
 		}
 
 		resp := map[string]any{}
-		if err := json.Unmarshal(respBytes, &resp); err != nil {
+		if err := msgpack.Unmarshal(respBytes, &resp); err != nil {
 			t.Fatalf("decode response failed: %v", err)
 		}
 

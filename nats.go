@@ -1,7 +1,6 @@
 package bus_nats
 
 import (
-	"encoding/json"
 	"errors"
 	"math/rand"
 	"sort"
@@ -12,6 +11,7 @@ import (
 	"github.com/bamgoo/bamgoo"
 	"github.com/bamgoo/bus"
 	"github.com/nats-io/nats.go"
+	"github.com/vmihailenco/msgpack/v5"
 )
 
 var (
@@ -552,7 +552,7 @@ func (c *natsBusConnection) publishAnnounceState(online bool) {
 	}
 	flag := online
 	payload.Online = &flag
-	data, err := json.Marshal(payload)
+	data, err := msgpack.Marshal(payload)
 	if err != nil {
 		return
 	}
@@ -562,7 +562,7 @@ func (c *natsBusConnection) publishAnnounceState(online bool) {
 
 func (c *natsBusConnection) onAnnounce(data []byte) {
 	var payload announcePayload
-	if err := json.Unmarshal(data, &payload); err != nil {
+	if err := msgpack.Unmarshal(data, &payload); err != nil {
 		return
 	}
 	if strings.TrimSpace(payload.Node) == "" {
