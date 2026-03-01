@@ -8,8 +8,8 @@ import (
 	"sync"
 	"time"
 
-	"github.com/bamgoo/bamgoo"
-	"github.com/bamgoo/bus"
+	"github.com/infrago/infra"
+	"github.com/infrago/bus"
 	"github.com/nats-io/nats.go"
 	"github.com/vmihailenco/msgpack/v5"
 )
@@ -41,8 +41,8 @@ type (
 		subjects map[string]struct{}
 		subs     []*nats.Subscription
 
-		identity bamgoo.NodeInfo
-		cache    map[string]bamgoo.NodeInfo
+		identity infra.NodeInfo
+		cache    map[string]infra.NodeInfo
 
 		announceInterval time.Duration
 		announceJitter   time.Duration
@@ -78,7 +78,7 @@ type (
 )
 
 func init() {
-	bamgoo.Register("nats", &natsBusDriver{})
+	infra.Register("nats", &natsBusDriver{})
 }
 
 func (driver *natsBusDriver) Connect(inst *bus.Instance) (bus.Connection, error) {
@@ -138,30 +138,30 @@ func (driver *natsBusDriver) Connect(inst *bus.Instance) (bus.Connection, error)
 		setting.AnnounceJitter = defaultAnnounceJitter
 	}
 
-	id := bamgoo.Identity()
+	id := infra.Identity()
 	project := id.Project
 	if strings.TrimSpace(project) == "" {
-		project = bamgoo.BAMGOO
+		project = infra.INFRAGO
 	}
 	node := id.Node
 	if strings.TrimSpace(node) == "" {
-		node = bamgoo.Generate("node")
+		node = infra.Generate("node")
 	}
 	profile := id.Profile
 	if strings.TrimSpace(profile) == "" {
-		profile = bamgoo.BAMGOO
+		profile = infra.INFRAGO
 	}
 	return &natsBusConnection{
 		instance: inst,
 		setting:  setting,
 		subjects: make(map[string]struct{}, 0),
 		subs:     make([]*nats.Subscription, 0),
-		identity: bamgoo.NodeInfo{
+		identity: infra.NodeInfo{
 			Project: project,
 			Node:    node,
 			Profile: profile,
 		},
-		cache:            make(map[string]bamgoo.NodeInfo, 0),
+		cache:            make(map[string]infra.NodeInfo, 0),
 		announceInterval: setting.AnnounceInterval,
 		announceJitter:   setting.AnnounceJitter,
 		announceTTL:      setting.AnnounceTTL,
@@ -345,17 +345,17 @@ func (c *natsBusConnection) Enqueue(subject string, data []byte) error {
 	return c.client.Publish(subject, data)
 }
 
-func (c *natsBusConnection) Stats() []bamgoo.ServiceStats {
+func (c *natsBusConnection) Stats() []infra.ServiceStats {
 	c.mutex.RLock()
 	defer c.mutex.RUnlock()
 
-	all := make([]bamgoo.ServiceStats, 0, len(c.stats))
+	all := make([]infra.ServiceStats, 0, len(c.stats))
 	for _, st := range c.stats {
 		avg := int64(0)
 		if st.numRequests > 0 {
 			avg = st.totalLatency / int64(st.numRequests)
 		}
-		all = append(all, bamgoo.ServiceStats{
+		all = append(all, infra.ServiceStats{
 			Name:         st.name,
 			Version:      c.setting.Version,
 			NumRequests:  st.numRequests,
@@ -367,12 +367,12 @@ func (c *natsBusConnection) Stats() []bamgoo.ServiceStats {
 	return all
 }
 
-func (c *natsBusConnection) ListNodes() []bamgoo.NodeInfo {
+func (c *natsBusConnection) ListNodes() []infra.NodeInfo {
 	c.mutex.RLock()
 	defer c.mutex.RUnlock()
 
 	now := time.Now().UnixMilli()
-	out := make([]bamgoo.NodeInfo, 0, len(c.cache))
+	out := make([]infra.NodeInfo, 0, len(c.cache))
 	for _, item := range c.cache {
 		if c.announceTTL > 0 && now-item.Updated > c.announceTTL.Milliseconds() {
 			continue
@@ -393,21 +393,21 @@ func (c *natsBusConnection) ListNodes() []bamgoo.NodeInfo {
 	return out
 }
 
-func (c *natsBusConnection) ListServices() []bamgoo.ServiceInfo {
+func (c *natsBusConnection) ListServices() []infra.ServiceInfo {
 	nodes := c.ListNodes()
 	if len(nodes) == 0 {
 		return nil
 	}
-	merged := make(map[string]*bamgoo.ServiceInfo)
+	merged := make(map[string]*infra.ServiceInfo)
 	for _, node := range nodes {
 		for _, svc := range node.Services {
 			svcKey := svc
 			info, ok := merged[svcKey]
 			if !ok {
-				info = &bamgoo.ServiceInfo{Service: svc, Name: svc}
+				info = &infra.ServiceInfo{Service: svc, Name: svc}
 				merged[svcKey] = info
 			}
-			info.Nodes = append(info.Nodes, bamgoo.ServiceNode{
+			info.Nodes = append(info.Nodes, infra.ServiceNode{
 				Node:    node.Node,
 				Profile: node.Profile,
 			})
@@ -417,7 +417,7 @@ func (c *natsBusConnection) ListServices() []bamgoo.ServiceInfo {
 		}
 	}
 
-	out := make([]bamgoo.ServiceInfo, 0, len(merged))
+	out := make([]infra.ServiceInfo, 0, len(merged))
 	for _, info := range merged {
 		sort.Slice(info.Nodes, func(i, j int) bool {
 			if info.Nodes[i].Profile == info.Nodes[j].Profile {
@@ -447,7 +447,7 @@ func (c *natsBusConnection) publishGroup(subject string) string {
 		group = strings.TrimSpace(c.identity.Profile)
 	}
 	if group == "" {
-		group = bamgoo.GLOBAL
+		group = infra.GLOBAL
 	}
 	return group + "." + subject
 }
@@ -569,7 +569,7 @@ func (c *natsBusConnection) onAnnounce(data []byte) {
 		return
 	}
 	if strings.TrimSpace(payload.Project) == "" {
-		payload.Project = bamgoo.BAMGOO
+		payload.Project = infra.INFRAGO
 	}
 	online := true
 	if payload.Online != nil {
@@ -585,7 +585,7 @@ func (c *natsBusConnection) onAnnounce(data []byte) {
 		return
 	}
 
-	c.cache[key] = bamgoo.NodeInfo{
+	c.cache[key] = infra.NodeInfo{
 		Project:  payload.Project,
 		Node:     payload.Node,
 		Profile:  payload.Profile,
@@ -638,10 +638,10 @@ func (c *natsBusConnection) systemPrefixValue() string {
 	}
 	project := strings.TrimSpace(c.identity.Project)
 	if project == "" {
-		project = strings.TrimSpace(bamgoo.Identity().Project)
+		project = strings.TrimSpace(infra.Identity().Project)
 	}
 	if project == "" {
-		project = bamgoo.BAMGOO
+		project = infra.INFRAGO
 	}
 	return project
 }

@@ -1,2 +1,2 @@
 # bus-nats
-bamgoo nats bus driver.
+infrago nats bus driver.

@@ -6,9 +6,9 @@ import (
 	"testing"
 	"time"
 
-	"github.com/bamgoo/bamgoo"
-	base "github.com/bamgoo/base"
-	"github.com/bamgoo/bus"
+	"github.com/infrago/infra"
+	base "github.com/infrago/base"
+	"github.com/infrago/bus"
 	"github.com/nats-io/nats-server/v2/server"
 	"github.com/vmihailenco/msgpack/v5"
 )
@@ -31,9 +31,9 @@ func TestNatsBusCrossNodeRequest(t *testing.T) {
 	defer ns.Shutdown()
 
 	serviceName := fmt.Sprintf("bus.test.%d", time.Now().UnixNano())
-	bamgoo.Register(serviceName, bamgoo.Method{
-		Action: func(ctx *bamgoo.Context) (base.Map, base.Res) {
-			return base.Map{"ok": true, "name": serviceName}, bamgoo.OK
+	infra.Register(serviceName, infra.Method{
+		Action: func(ctx *infra.Context) (base.Map, base.Res) {
+			return base.Map{"ok": true, "name": serviceName}, infra.OK
 		},
 	})
 
